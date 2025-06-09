@@ -22,52 +22,215 @@
 #include "config.h"
 
 namespace mooncake {
-const static uint8_t MAX_HOP_LIMIT = 16;
-const static uint8_t TIMEOUT = 14;
-const static uint8_t RETRY_CNT = 7;
+/**
+ * @brief RDMA连接参数常量定义
+ */
+const static uint8_t MAX_HOP_LIMIT = 16;  // 最大跳数限制，用于路由
+const static uint8_t TIMEOUT = 14;        // 超时时间，以4.096微秒为单位
+const static uint8_t RETRY_CNT = 7;       // 重试次数，发生错误时重试
 
+/**
+ * @brief RDMA端点构造函数
+ * @param context RDMA上下文引用
+ *
+ * 初始化端点的基本状态：
+ * 1. 设置初始化状态
+ * 2. 标记端点为活跃状态
+ * 3. 关联RDMA上下文
+ */
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context), status_(INITIALIZING), active_(true) {}
 
+/**
+ * @brief RDMA端点析构函数
+ *
+ * 清理端点资源：
+ * 1. 检查队列对列表
+ * 2. 如果存在队列对，调用deconstruct()清理
+ */
 RdmaEndPoint::~RdmaEndPoint() {
     if (!qp_list_.empty()) deconstruct();
 }
 
+/**
+ * @brief 构造RDMA端点
+ * @param cq 完成队列指针
+ * @param num_qp_list 队列对数量
+ * @param max_sge_per_wr 每个工作请求的最大分散/聚集元素数
+ * @param max_wr_depth 最大工作请求深度
+ * @param max_inline_bytes 最大内联数据大小
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数完成端点的初始化配置：
+ * 1. 验证端点状态
+ * 2. 分配队列对资源
+ * 3. 初始化工作请求深度计数器
+ * 4. 创建所需数量的队列对
+ */
 int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
-                            size_t max_sge_per_wr, size_t max_wr_depth,
-                            size_t max_inline_bytes) {
+                           size_t max_sge_per_wr, size_t max_wr_depth,
+                           size_t max_inline_bytes) {
+    // 验证端点状态
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
         LOG(ERROR) << "Endpoint has already been constructed";
         return ERR_ENDPOINT;
     }
 
+    // 初始化队列对列表
     qp_list_.resize(num_qp_list);
 
+    // 设置最大工作请求深度
     max_wr_depth_ = (int)max_wr_depth;
+    // 为每个队列对分配工作请求深度计数器
     wr_depth_list_ = new volatile int[num_qp_list];
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
     }
+
+    // 初始化每个队列对的工作请求深度
     for (size_t i = 0; i < num_qp_list; ++i) {
         wr_depth_list_[i] = 0;
-        ibv_qp_init_attr attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.send_cq = cq;
-        attr.recv_cq = cq;
-        attr.sq_sig_all = false;
-        attr.qp_type = IBV_QPT_RC;
-        attr.cap.max_send_wr = attr.cap.max_recv_wr = max_wr_depth;
-        attr.cap.max_send_sge = attr.cap.max_recv_sge = max_sge_per_wr;
-        attr.cap.max_inline_data = max_inline_bytes;
-        qp_list_[i] = ibv_create_qp(context_.pd(), &attr);
-        if (!qp_list_[i]) {
-            PLOG(ERROR) << "Failed to create QP";
-            return ERR_ENDPOINT;
+        // 创建队列对
+        if (createQueuePair(i, cq, max_sge_per_wr, max_wr_depth,
+                           max_inline_bytes)) {
+            LOG(ERROR) << "Failed to create queue pair " << i;
+            return ERR_QP_CREATE;
         }
     }
 
-    status_.store(UNCONNECTED, std::memory_order_relaxed);
+    // 更新端点状态为未连接
+    status_.store(UNCONNECTED, std::memory_order_release);
+    return 0;
+}
+
+/**
+ * @brief 创建单个队列对
+ * @param qp_index 队列对索引
+ * @param cq 完成队列指针
+ * @param max_sge 最大分散/聚集元素数
+ * @param max_wr 最大工作请求数
+ * @param max_inline 最大内联数据大小
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数创建并初始化单个RDMA队列对：
+ * 1. 设置队列对属性
+ * 2. 创建队列对
+ * 3. 将队列对转换到INIT状态
+ */
+int RdmaEndPoint::createQueuePair(size_t qp_index, ibv_cq *cq,
+                                 size_t max_sge, size_t max_wr,
+                                 size_t max_inline) {
+    struct ibv_qp_init_attr qp_init_attr;
+    memset(&qp_init_attr, 0, sizeof(qp_init_attr));
+
+    // 设置发送和接收队列的参数
+    qp_init_attr.send_cq = cq;                // 发送完成队列
+    qp_init_attr.recv_cq = cq;                // 接收完成队列
+    qp_init_attr.srq = nullptr;               // 不使用共享接收队列
+    qp_init_attr.cap.max_send_wr = max_wr;    // 最大发送工作请求数
+    qp_init_attr.cap.max_recv_wr = max_wr;    // 最大接收工作请求数
+    qp_init_attr.cap.max_send_sge = max_sge;  // 最大发送分散/聚集元素数
+    qp_init_attr.cap.max_recv_sge = max_sge;  // 最大接收分散/聚集元素数
+    qp_init_attr.cap.max_inline_data = max_inline;  // 最大内联数据大小
+    qp_init_attr.qp_type = IBV_QPT_RC;        // 使用可靠连接传输服务
+    qp_init_attr.sq_sig_all = 0;              // 不为所有发送请求生成完成事件
+
+    // 创建队列对
+    qp_list_[qp_index] = ibv_create_qp(context_.getPd(), &qp_init_attr);
+    if (!qp_list_[qp_index]) {
+        LOG(ERROR) << "Failed to create queue pair";
+        return ERR_QP_CREATE;
+    }
+
+    // 修改队列对状态为INIT
+    return modifyQueuePairState(qp_index, IBV_QPS_INIT);
+}
+
+/**
+ * @brief 修改队列对状态
+ * @param qp_index 队列对索引
+ * @param target_state 目标状态
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数用于修改队列对的状态：
+ * 1. 根据目标状态设置队列对属性
+ * 2. 调用ibv_modify_qp修改状态
+ * 3. 验证状态转换结果
+ */
+int RdmaEndPoint::modifyQueuePairState(size_t qp_index,
+                                      enum ibv_qp_state target_state) {
+    struct ibv_qp_attr attr;
+    int attr_mask;
+    memset(&attr, 0, sizeof(attr));
+
+    switch (target_state) {
+        case IBV_QPS_INIT:
+            // 初始化状态配置
+            attr.qp_state = IBV_QPS_INIT;
+            attr.port_num = context_.getPort();
+            attr.pkey_index = 0;
+            attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |  // 本地写权限
+                                 IBV_ACCESS_REMOTE_READ |   // 远程读权限
+                                 IBV_ACCESS_REMOTE_WRITE;   // 远程写权限
+            attr_mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+                       IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
+            break;
+
+        case IBV_QPS_RTR:
+            // 准备接收状态配置
+            attr.qp_state = IBV_QPS_RTR;
+            attr.path_mtu = IBV_MTU_4096;           // 最大传输单元大小
+            attr.dest_qp_num = remote_qp_num_;      // 对端队列对编号
+            attr.rq_psn = 0;                        // 接收序列号
+            attr.max_dest_rd_atomic = 1;            // 最大目标原子操作数
+            attr.min_rnr_timer = 12;                // 最小RNR NAK定时器值
+
+            // 设置主路径属性
+            attr.ah_attr.is_global = 1;             // 使用全局路由
+            attr.ah_attr.grh.hop_limit = MAX_HOP_LIMIT;  // 最大跳数
+            attr.ah_attr.grh.dgid = remote_gid_;    // 目标GID
+            attr.ah_attr.grh.sgid_index = context_.getGidIndex();  // 源GID索引
+            attr.ah_attr.dlid = remote_lid_;        // 目标LID
+            attr.ah_attr.sl = 0;                    // 服务级别
+            attr.ah_attr.src_path_bits = 0;         // 源路径位
+            attr.ah_attr.port_num = context_.getPort();  // 端口号
+
+            attr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                       IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                       IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+            break;
+
+        case IBV_QPS_RTS:
+            // 准备发送状态配置
+            attr.qp_state = IBV_QPS_RTS;
+            attr.timeout = TIMEOUT;                 // 传输超时时间
+            attr.retry_cnt = RETRY_CNT;             // 重试次数
+            attr.rnr_retry = RETRY_CNT;             // RNR重试次数
+            attr.sq_psn = 0;                        // 发送序列号
+            attr.max_rd_atomic = 1;                 // 最大原子操作数
+            attr_mask = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                       IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                       IBV_QP_MAX_QP_RD_ATOMIC;
+            break;
+
+        case IBV_QPS_ERR:
+            // 错误状态配置
+            attr.qp_state = IBV_QPS_ERR;
+            attr_mask = IBV_QP_STATE;
+            break;
+
+        default:
+            LOG(ERROR) << "Unknown QP state: " << target_state;
+            return ERR_INVALID_ARGUMENT;
+    }
+
+    // 修改队列对状态
+    if (ibv_modify_qp(qp_list_[qp_index], &attr, attr_mask)) {
+        LOG(ERROR) << "Failed to modify QP state to " << target_state;
+        return ERR_QP_MODIFY;
+    }
+
     return 0;
 }
 

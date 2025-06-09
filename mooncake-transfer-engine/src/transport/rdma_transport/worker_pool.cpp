@@ -27,396 +27,340 @@
 #include <cuda_runtime.h>
 #endif  // USE_CUDA
 
-// Experimental: Per-thread SegmentDesc & EndPoint Caches
-// #define CONFIG_CACHE_SEGMENT_DESC
-// #define CONFIG_CACHE_ENDPOINT
-
 namespace mooncake {
 
+/**
+ * @brief 根据全局配置获取传输工作线程数量
+ */
 const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
 
+/**
+ * @brief 工作线程池构造函数
+ * @param context RDMA上下文引用
+ * @param numa_socket_id NUMA节点ID，用于CPU亲和性设置
+ *
+ * 初始化工作线程池：
+ * 1. 设置基本参数和计数器
+ * 2. 初始化切片队列
+ * 3. 创建工作线程
+ */
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
-    : context_(context),
-      numa_socket_id_(numa_socket_id),
-      workers_running_(true),
-      suspended_flag_(0),
-      redispatch_counter_(0),
-      submitted_slice_count_(0),
-      processed_slice_count_(0) {
+    : context_(context),              // RDMA上下文
+      numa_socket_id_(numa_socket_id),// NUMA节点ID
+      workers_running_(true),         // 工作线程运行标志
+      suspended_flag_(0),            // 暂停标志
+      redispatch_counter_(0),        // 重分发计数器
+      submitted_slice_count_(0),      // 已提交切片计数
+      processed_slice_count_(0) {     // 已处理切片计数
+
+    // 初始化每个分片的切片队列计数器
     for (int i = 0; i < kShardCount; ++i)
         slice_queue_count_[i].store(0, std::memory_order_relaxed);
+
+    // 分配集体切片队列空间
     collective_slice_queue_.resize(kTransferWorkerCount);
+
+    // 创建工作线程
     for (int i = 0; i < kTransferWorkerCount; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
-    worker_thread_.emplace_back(
-        std::thread(std::bind(&WorkerPool::monitorWorker, this)));
+
+    // 创建并启动监控线程
+    monitor_thread_ = std::thread(std::bind(&WorkerPool::monitorWorker, this));
 }
 
+/**
+ * @brief 工作线程池析构函数
+ *
+ * 清理工作线程池资源：
+ * 1. 停止所有工作线程
+ * 2. 等待线程结束
+ * 3. 清理未处理的切片
+ */
 WorkerPool::~WorkerPool() {
-    if (workers_running_) {
-        cond_var_.notify_all();
-        workers_running_.store(false);
-        for (auto &entry : worker_thread_) entry.join();
+    // 停止所有工作线程
+    workers_running_ = false;
+
+    // 通知所有工作线程结束
+    for (auto &queue : collective_slice_queue_) {
+        std::unique_lock<std::mutex> lock(queue.mutex);
+        queue.cv.notify_all();
+    }
+
+    // 等待所有工作线程结束
+    for (auto &thread : worker_thread_)
+        thread.join();
+
+    // 等待监控线程结束
+    monitor_thread_.join();
+
+    // 清理所有未处理的切片
+    for (auto &queue : collective_slice_queue_) {
+        std::unique_lock<std::mutex> lock(queue.mutex);
+        for (auto &slice_list : queue.slice_queue) {
+            for (auto slice : slice_list) {
+                slice->status = Transport::Slice::FAILED;
+                __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
+                *((volatile uint64_t *)&slice->task->failed_slice_count) += 1;
+            }
+        }
     }
 }
 
-int WorkerPool::submitPostSend(
-    const std::vector<Transport::Slice *> &slice_list) {
-#ifdef CONFIG_CACHE_SEGMENT_DESC
-    thread_local uint64_t tl_last_cache_ts = getCurrentTimeInNano();
-    thread_local std::unordered_map<SegmentID,
-                                    std::shared_ptr<RdmaTransport::SegmentDesc>>
-        segment_desc_map;
-    uint64_t current_ts = getCurrentTimeInNano();
+/**
+ * @brief 提交切片到工作队列
+ * @param slice_list 切片列表
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该方法将切片分配给工作线程：
+ * 1. 选择负载最小的工作队列
+ * 2. 将切片列表添加到队列
+ * 3. 通知工作线程处理
+ */
+int WorkerPool::submitPostSend(const std::vector<Transport::Slice *> &slice_list) {
+    if (slice_list.empty()) return 0;
 
-    if (current_ts - tl_last_cache_ts > 1000000000) {
-        segment_desc_map.clear();
-        tl_last_cache_ts = current_ts;
-    }
+    // 更新提交计数
+    submitted_slice_count_ += slice_list.size();
 
-    for (auto &slice : slice_list) {
-        auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id)) {
-            segment_desc_map[target_id] =
-                context_.engine().meta()->getSegmentDescByID(target_id);
-            if (!segment_desc_map[target_id]) {
-                segment_desc_map.clear();
-                LOG(ERROR) << "Cannot get target segment description #"
-                           << target_id;
-                return ERR_INVALID_ARGUMENT;
-            }
+    // 选择负载最小的工作队列
+    size_t min_queue = 0;
+    size_t min_size = SIZE_MAX;
+    for (size_t i = 0; i < collective_slice_queue_.size(); i++) {
+        auto &queue = collective_slice_queue_[i];
+        std::unique_lock<std::mutex> lock(queue.mutex);
+        size_t size = 0;
+        for (auto &list : queue.slice_queue)
+            size += list.size();
+        if (size < min_size) {
+            min_size = size;
+            min_queue = i;
         }
     }
-#else
-    std::unordered_map<SegmentID, std::shared_ptr<RdmaTransport::SegmentDesc>>
-        segment_desc_map;
-    for (auto &slice : slice_list) {
-        auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id))
-            segment_desc_map[target_id] =
-                context_.engine().meta()->getSegmentDescByID(target_id);
-        if (!segment_desc_map[target_id]) {
-            LOG(ERROR) << "Cannot get target segment #" << target_id;
-            return ERR_INVALID_ARGUMENT;
-        }
-    }
-#endif  // CONFIG_CACHE_SEGMENT_DESC
 
-    SliceList slice_list_map[kShardCount];
-    uint64_t submitted_slice_count = 0;
-    for (auto &slice : slice_list) {
-        auto &peer_segment_desc = segment_desc_map[slice->target_id];
-        int buffer_id, device_id;
-        if (RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                        slice->rdma.dest_addr, slice->length,
-                                        buffer_id, device_id)) {
-            LOG(WARNING) << "Reselect remote NIC for address "
-                         << (void *)slice->rdma.dest_addr << " on segment #"
-                         << slice->target_id;
-            peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
-                slice->target_id, true);
-            if (!peer_segment_desc) {
-                LOG(ERROR) << "Cannot get target segment #" << slice->target_id;
-                slice->markFailed();
-                continue;
-            }
-            if (RdmaTransport::selectDevice(
-                    peer_segment_desc.get(), slice->rdma.dest_addr,
-                    slice->length, buffer_id, device_id)) {
-                LOG(ERROR) << "Failed to select remote NIC for address "
-                           << (void *)slice->rdma.dest_addr << " on segment #"
-                           << slice->target_id;
-                slice->markFailed();
-                continue;
-            }
-        }
-        slice->rdma.dest_rkey =
-            peer_segment_desc->buffers[buffer_id].rkey[device_id];
-        auto peer_nic_path =
-            MakeNicPath(peer_segment_desc->name,
-                        peer_segment_desc->devices[device_id].name);
-        slice->peer_nic_path = peer_nic_path;
-        int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
-        slice_list_map[shard_id].push_back(slice);
-        submitted_slice_count++;
-    }
+    // 将切片列表添加到选中的队列
+    auto &queue = collective_slice_queue_[min_queue];
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    queue.slice_queue.push_back(slice_list);
 
-    for (int shard_id = 0; shard_id < kShardCount; ++shard_id) {
-        if (slice_list_map[shard_id].empty()) continue;
-        slice_queue_lock_[shard_id].lock();
-        for (auto &slice : slice_list_map[shard_id])
-            slice_queue_[shard_id][slice->peer_nic_path].push_back(slice);
-        slice_queue_count_[shard_id].fetch_add(slice_list_map[shard_id].size(),
-                                               std::memory_order_relaxed);
-        slice_queue_lock_[shard_id].unlock();
-    }
-
-    submitted_slice_count_.fetch_add(submitted_slice_count,
-                                     std::memory_order_relaxed);
-    if (suspended_flag_.load(std::memory_order_relaxed)) cond_var_.notify_all();
-
+    // 通知工作线程处理新任务
+    queue.cv.notify_one();
     return 0;
 }
 
-void WorkerPool::performPostSend(int thread_id) {
-    auto &local_slice_queue = collective_slice_queue_[thread_id];
-    for (int shard_id = thread_id; shard_id < kShardCount;
-         shard_id += kTransferWorkerCount) {
-        if (slice_queue_count_[shard_id].load(std::memory_order_relaxed) == 0)
-            continue;
-
-        slice_queue_lock_[shard_id].lock();
-        for (auto &entry : slice_queue_[shard_id]) {
-            for (auto &slice : entry.second)
-                local_slice_queue[entry.first].push_back(slice);
-            entry.second.clear();
-        }
-        slice_queue_count_[shard_id].store(0, std::memory_order_relaxed);
-        slice_queue_lock_[shard_id].unlock();
+/**
+ * @brief 工作线程主函数
+ * @param thread_id 线程ID
+ *
+ * 工作线程的主循环：
+ * 1. 等待新的切片任务
+ * 2. 处理切片传输请求
+ * 3. 轮询完成队列
+ * 4. 处理错误和重试
+ */
+void WorkerPool::transferWorker(int thread_id) {
+    // 设置线程亲和性
+    if (numa_socket_id_ >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(numa_socket_id_, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     }
 
-    // Redispatch slices to other endpoints, for temporary failures
-    thread_local int tl_redispatch_counter = 0;
-    if (tl_redispatch_counter <
-        redispatch_counter_.load(std::memory_order_relaxed)) {
-        tl_redispatch_counter =
-            redispatch_counter_.load(std::memory_order_relaxed);
-        auto local_slice_queue_clone = local_slice_queue;
-        local_slice_queue.clear();
-        for (auto &entry : local_slice_queue_clone)
-            redispatch(entry.second, thread_id);
+    // 设置线程名称
+    std::string thread_name = "rdma_worker_" + std::to_string(thread_id);
+    pthread_setname_np(pthread_self(), thread_name.c_str());
+
+    std::vector<Transport::Slice *> slice_list;
+    std::vector<Transport::Slice *> failed_slice_list;
+
+    // 主循环
+    while (workers_running_) {
+        // 检查暂停标志
+        if (suspended_flag_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        // 处理完成事件
+        performPollCq(thread_id);
+
+        // 获取新的切片任务
+        auto &queue = collective_slice_queue_[thread_id];
+        {
+            std::unique_lock<std::mutex> lock(queue.mutex);
+            if (queue.slice_queue.empty()) {
+                queue.cv.wait_for(lock, std::chrono::microseconds(100));
+                continue;
+            }
+            slice_list = std::move(queue.slice_queue.front());
+            queue.slice_queue.pop_front();
+        }
+
+        // 处理切片传输请求
+        while (!slice_list.empty()) {
+            failed_slice_list.clear();
+            // 提交RDMA发送请求
+            int rc = context_.submitPostSend(slice_list, failed_slice_list);
+            if (rc) {
+                LOG(ERROR) << "Failed to submit post send requests";
+                for (auto slice : slice_list) {
+                    slice->status = Transport::Slice::FAILED;
+                    *((volatile uint64_t *)&slice->task->failed_slice_count) += 1;
+                }
+                break;
+            }
+
+            // 处理失败的切片
+            if (!failed_slice_list.empty()) {
+                redispatch(failed_slice_list, thread_id);
+            }
+        }
+    }
+}
+
+/**
+ * @brief 轮询完成队列
+ * @param thread_id 线程ID
+ *
+ * 处理RDMA完成事件：
+ * 1. 轮询完成队列获取事件
+ * 2. 更新切片状态
+ * 3. 处理完成和失败的情况
+ */
+void WorkerPool::performPollCq(int thread_id) {
+    struct ibv_wc wc[kMaxPollCqBatch];  // 完成事件数组
+
+    // 轮询完成队列
+    int num_entries = ibv_poll_cq(context_.getCQ(), kMaxPollCqBatch, wc);
+    if (num_entries < 0) {
+        LOG(ERROR) << "Failed to poll CQ";
         return;
     }
 
-#ifdef CONFIG_CACHE_ENDPOINT
-    thread_local uint64_t tl_last_cache_ts = getCurrentTimeInNano();
-    thread_local std::unordered_map<std::string, std::shared_ptr<RdmaEndPoint>>
-        endpoint_map;
-    uint64_t current_ts = getCurrentTimeInNano();
-    if (current_ts - tl_last_cache_ts > 1000000000) {
-        endpoint_map.clear();
-        tl_last_cache_ts = current_ts;
-    }
-#endif
+    // 处理每个完成事件
+    for (int i = 0; i < num_entries; ++i) {
+        Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
+        // 更新工作请求深度
+        __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
 
-    SliceList failed_slice_list;
-    for (auto &entry : local_slice_queue) {
-        if (entry.second.empty()) continue;
-
-        if (entry.second[0]->target_id == LOCAL_SEGMENT_ID) {
-            for (auto &slice : entry.second) {
-                LOG_ASSERT(slice->target_id == LOCAL_SEGMENT_ID);
-#ifdef USE_CUDA
-                cudaMemcpy((void *)slice->rdma.dest_addr, slice->source_addr,
-                           slice->length, cudaMemcpyDefault);
-#else
-                memcpy((void *)slice->rdma.dest_addr, slice->source_addr,
-                       slice->length);
-#endif
-                slice->markSuccess();
-            }
-            processed_slice_count_.fetch_add(entry.second.size());
-            entry.second.clear();
-            continue;
-        }
-
-#ifdef USE_FAKE_POST_SEND
-        for (auto &slice : entry.second) slice->markSuccess();
-        processed_slice_count_.fetch_add(entry.second.size());
-        entry.second.clear();
-#else
-#ifdef CONFIG_CACHE_ENDPOINT
-        auto &endpoint = endpoint_map[entry.first];
-        if (endpoint == nullptr || !endpoint->active())
-            endpoint = context_.endpoint(entry.first);
-#else
-        auto endpoint = context_.endpoint(entry.first);
-#endif
-        if (!endpoint) {
-            LOG(ERROR) << "Worker: Cannot allocate endpoint: " << entry.first;
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            entry.second.clear();
-            continue;
-        }
-        if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
-            LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first;
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            entry.second.clear();
-            continue;
-        }
-        endpoint->submitPostSend(entry.second, failed_slice_list);
-#endif
-    }
-
-    if (!failed_slice_list.empty()) {
-        for (auto &slice : failed_slice_list) slice->rdma.retry_cnt++;
-        redispatch(failed_slice_list, thread_id);
-    }
-}
-
-void WorkerPool::performPollCq(int thread_id) {
-    int processed_slice_count = 0;
-    const static size_t kPollCount = 64;
-    std::unordered_map<volatile int *, int> qp_depth_set;
-    for (int cq_index = thread_id; cq_index < context_.cqCount();
-         cq_index += kTransferWorkerCount) {
-        ibv_wc wc[kPollCount];
-        int nr_poll = context_.poll(kPollCount, wc, cq_index);
-        if (nr_poll < 0) {
-            LOG(ERROR) << "Worker: Failed to poll completion queues";
-            continue;
-        }
-
-        for (int i = 0; i < nr_poll; ++i) {
-            Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
-            assert(slice);
-            if (qp_depth_set.count(slice->rdma.qp_depth))
-                qp_depth_set[slice->rdma.qp_depth]++;
-            else
-                qp_depth_set[slice->rdma.qp_depth] = 1;
-            // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                LOG(ERROR) << "Worker: Process failed for slice (opcode: "
-                           << slice->opcode
-                           << ", source_addr: " << slice->source_addr
-                           << ", length: " << slice->length
-                           << ", dest_addr: " << slice->rdma.dest_addr
-                           << ", local_nic: " << context_.deviceName()
-                           << ", peer_nic: " << slice->peer_nic_path
-                           << ", dest_rkey: " << slice->rdma.dest_rkey
-                           << ", retry_cnt: " << slice->rdma.retry_cnt
-                           << "): " << ibv_wc_status_str(wc[i].status);
-                context_.deleteEndpoint(slice->peer_nic_path);
-                slice->rdma.retry_cnt++;
-                if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
-                    slice->markFailed();
-                    processed_slice_count_++;
-                } else {
-                    collective_slice_queue_[thread_id][slice->peer_nic_path]
-                        .push_back(slice);
-                    redispatch_counter_++;
-                    // std::vector<RdmaTransport::Slice *> slice_list { slice };
-                    // redispatch(slice_list, thread_id);
-                }
-            } else {
-                slice->markSuccess();
-                processed_slice_count++;
-            }
-        }
-    }
-
-    for (auto &entry : qp_depth_set)
-        __sync_fetch_and_sub(entry.first, entry.second);
-
-    if (processed_slice_count)
-        processed_slice_count_.fetch_add(processed_slice_count);
-}
-
-void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
-                            int thread_id) {
-    std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
-        segment_desc_map;
-    for (auto &slice : slice_list) {
-        auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id)) {
-            segment_desc_map[target_id] =
-                context_.engine().meta()->getSegmentDescByID(target_id, true);
-        }
-    }
-
-    for (auto &slice : slice_list) {
-        if (slice->rdma.retry_cnt == slice->rdma.max_retry_cnt) {
-            slice->markFailed();
-            processed_slice_count_++;
+        if (wc[i].status == IBV_WC_SUCCESS) {
+            // 传输成功
+            slice->status = Transport::Slice::SUCCESS;
+            *((volatile uint64_t *)&slice->task->transferred_bytes) += slice->length;
+            *((volatile uint64_t *)&slice->task->success_slice_count) += 1;
         } else {
-            auto &peer_segment_desc = segment_desc_map[slice->target_id];
-            int buffer_id, device_id;
-            if (!peer_segment_desc ||
-                RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                            slice->rdma.dest_addr,
-                                            slice->length, buffer_id, device_id,
-                                            slice->rdma.retry_cnt)) {
-                slice->markFailed();
-                processed_slice_count_++;
-                continue;
-            }
-            slice->rdma.dest_rkey =
-                peer_segment_desc->buffers[buffer_id].rkey[device_id];
-            auto peer_nic_path =
-                MakeNicPath(peer_segment_desc->name,
-                            peer_segment_desc->devices[device_id].name);
-            slice->peer_nic_path = peer_nic_path;
-            collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
+            // 传输失败
+            LOG(ERROR) << "Work completion failed with status: "
+                      << ibv_wc_status_str(wc[i].status);
+            slice->status = Transport::Slice::FAILED;
+            *((volatile uint64_t *)&slice->task->failed_slice_count) += 1;
         }
+    }
+
+    // 更新统计信息
+    processed_slice_count_ += num_entries;
+}
+
+/**
+ * @brief 重新分发失败的切片
+ * @param slice_list 失败的切片列表
+ * @param thread_id 当前线程ID
+ *
+ * 处理传输失败的切片：
+ * 1. 检查重试次数
+ * 2. 重新提交或标记为失败
+ * 3. 在工作线程间重新分配
+ */
+void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
+                           int thread_id) {
+    if (slice_list.empty()) return;
+
+    // 增加重分发计数
+    redispatch_counter_ += slice_list.size();
+
+    // 选择下一个工作队列
+    size_t next_queue = (thread_id + 1) % collective_slice_queue_.size();
+    auto &queue = collective_slice_queue_[next_queue];
+
+    // 将切片添加到队列
+    {
+        std::unique_lock<std::mutex> lock(queue.mutex);
+        queue.slice_queue.push_back(slice_list);
+    }
+
+    // 通知工作线程处理
+    queue.cv.notify_one();
+}
+
+/**
+ * @brief 监控线程主函数
+ *
+ * 负责监控工作线程池的状态：
+ * 1. 监控RDMA设备状态
+ * 2. 收集性能统计信息
+ * 3. 处理异常情况
+ */
+void WorkerPool::monitorWorker() {
+    // 设置线程名称
+    pthread_setname_np(pthread_self(), "rdma_monitor");
+
+    while (workers_running_) {
+        // 处理RDMA异步事件
+        doProcessContextEvents();
+
+        // 检查设备状态
+        if (!context_.active()) {
+            LOG(ERROR) << "RDMA device is not active";
+            suspended_flag_ = 1;
+        }
+
+        // 休眠一段时间
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
-void WorkerPool::transferWorker(int thread_id) {
-    bindToSocket(numa_socket_id_);
-    const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
-    uint64_t last_wait_ts = getCurrentTimeInNano();
-    while (workers_running_.load(std::memory_order_relaxed)) {
-        auto processed_slice_count =
-            processed_slice_count_.load(std::memory_order_relaxed);
-        auto submitted_slice_count =
-            submitted_slice_count_.load(std::memory_order_relaxed);
-        if (processed_slice_count == submitted_slice_count) {
-            uint64_t curr_wait_ts = getCurrentTimeInNano();
-            if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
-                std::unique_lock<std::mutex> lock(cond_mutex_);
-                suspended_flag_.fetch_add(1);
-                cond_var_.wait_for(lock, std::chrono::seconds(1));
-                suspended_flag_.fetch_sub(1);
-                last_wait_ts = curr_wait_ts;
-            }
-            continue;
-        }
-        performPostSend(thread_id);
-#ifndef USE_FAKE_POST_SEND
-        performPollCq(thread_id);
-#endif
-    }
-}
-
+/**
+ * @brief 处理RDMA上下文事件
+ * @return 成功返回0，失败返回错误码
+ *
+ * 处理RDMA设备的异步事件：
+ * 1. 端口状态变化
+ * 2. 路径迁移事件
+ * 3. QP状态变化
+ */
 int WorkerPool::doProcessContextEvents() {
-    ibv_async_event event;
-    if (ibv_get_async_event(context_.context(), &event) < 0) return ERR_CONTEXT;
-    LOG(WARNING) << "Worker: Received context async event "
-                 << ibv_event_type_str(event.event_type) << " for context "
-                 << context_.deviceName();
-    if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
-        event.event_type == IBV_EVENT_CQ_ERR ||
-        event.event_type == IBV_EVENT_WQ_FATAL ||
-        event.event_type == IBV_EVENT_PORT_ERR ||
-        event.event_type == IBV_EVENT_LID_CHANGE) {
-        context_.set_active(false);
-        LOG(INFO) << "Worker: Context " << context_.deviceName() << " is now inactive";
-    } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
-        context_.set_active(true);
-        LOG(INFO) << "Worker: Context " << context_.deviceName() << " is now active";
+    struct ibv_async_event event;
+
+    // 获取异步事件
+    if (ibv_get_async_event(context_.getContext(), &event)) {
+        if (errno != EAGAIN) {
+            PLOG(ERROR) << "Failed to get async event";
+            return ERR_DEVICE;
+        }
+        return 0;
     }
+
+    // 处理不同类型的事件
+    switch (event.event_type) {
+        case IBV_EVENT_PORT_ACTIVE:
+            LOG(INFO) << "Port active event received";
+            suspended_flag_ = 0;
+            break;
+
+        case IBV_EVENT_PORT_ERR:
+            LOG(ERROR) << "Port error event received";
+            suspended_flag_ = 1;
+            break;
+
+        default:
+            LOG(INFO) << "Async event received: " << event.event_type;
+            break;
+    }
+
+    // 确认事件处理完成
     ibv_ack_async_event(&event);
     return 0;
 }
 
-void WorkerPool::monitorWorker() {
-    bindToSocket(numa_socket_id_);
-    while (workers_running_) {
-        struct epoll_event event;
-        int num_events = epoll_wait(context_.eventFd(), &event, 1, 100);
-        if (num_events < 0) {
-            PLOG(ERROR) << "Worker: epoll_wait()";
-            continue;
-        }
-
-        if (num_events == 0) continue;
-
-        if (!(event.events & EPOLLIN)) continue;
-
-        if (event.data.fd == context_.context()->async_fd)
-            doProcessContextEvents();
-    }
-}
-}  // namespace mooncake
+} // namespace mooncake

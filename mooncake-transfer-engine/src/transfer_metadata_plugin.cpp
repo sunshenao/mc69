@@ -36,9 +36,186 @@
 #include "error.h"
 
 namespace mooncake {
-#ifdef USE_REDIS
-struct RedisStoragePlugin : public MetadataStoragePlugin {
-    RedisStoragePlugin(const std::string &metadata_uri)
+
+/**
+ * @brief HTTP元数据存储插件的回调函数
+ * 用于处理HTTP请求的响应数据
+ *
+ * @param contents 响应内容的指针
+ * @param size 每个数据块的大小
+ * @param nmemb 数据块的数量
+ * @param userdata 用户自定义数据指针
+ * @return size_t 实际处理的数据大小
+ */
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userdata) {
+    ((std::string*)userdata)->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+/**
+ * @brief HTTP元数据存储插件实现
+ *
+ * 该插件通过HTTP协议与远程服务器通信，用于：
+ * 1. 存储和获取分布式系统的元数据信息
+ * 2. 支持REST风格的API调用
+ * 3. 处理JSON格式的数据交换
+ */
+struct HttpMetadataStoragePlugin : public MetadataStoragePlugin {
+    HttpMetadataStoragePlugin(const std::string &metadata_uri)
+        : client_(nullptr), metadata_uri_(metadata_uri) {
+        curl_global_init(CURL_GLOBAL_ALL);
+        client_ = curl_easy_init();
+        if (!client_) {
+            LOG(ERROR) << "Cannot allocate CURL objects";
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    virtual ~HttpMetadataStoragePlugin() {
+        curl_easy_cleanup(client_);
+        curl_global_cleanup();
+    }
+
+    std::string encodeUrl(const std::string &key) {
+        char *newkey = curl_easy_escape(client_, key.c_str(), key.size());
+        std::string encodedKey(newkey);
+        std::string url = metadata_uri_ + "?key=" + encodedKey;
+        curl_free(newkey);
+        return url;
+    }
+
+    virtual bool get(const std::string &key, Json::Value &value) {
+        curl_easy_reset(client_);
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
+
+        std::string url = encodeUrl(key);
+        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, WriteCallback);
+
+        // get response body
+        std::string readBuffer;
+        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
+        CURLcode res = curl_easy_perform(client_);
+        if (res != CURLE_OK) {
+            LOG(ERROR) << "Error from http client, GET " << url
+                       << " error: " << curl_easy_strerror(res);
+            return false;
+        }
+
+        // Get the HTTP response code
+        long responseCode;
+        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
+        if (responseCode != 200) {
+            LOG(ERROR) << "Unexpected code in http response, GET " << url
+                       << " response code: " << responseCode
+                       << " response body: " << readBuffer;
+            return false;
+        }
+
+        if (globalConfig().verbose)
+            LOG(INFO) << "Get segment desc, key=" << key
+                      << ", value=" << readBuffer;
+
+        Json::Reader reader;
+        if (!reader.parse(readBuffer, value)) return false;
+        return true;
+    }
+
+    virtual bool set(const std::string &key, const Json::Value &value) {
+        curl_easy_reset(client_);
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
+
+        Json::FastWriter writer;
+        const std::string json_file = writer.write(value);
+        if (globalConfig().verbose)
+            LOG(INFO) << "Put segment desc, key=" << key
+                      << ", value=" << json_file;
+
+        std::string url = encodeUrl(key);
+        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(client_, CURLOPT_POSTFIELDS, json_file.c_str());
+        curl_easy_setopt(client_, CURLOPT_POSTFIELDSIZE, json_file.size());
+        curl_easy_setopt(client_, CURLOPT_CUSTOMREQUEST, "PUT");
+
+        // get response body
+        std::string readBuffer;
+        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
+
+        // set content-type to application/json
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(client_, CURLOPT_HTTPHEADER, headers);
+        CURLcode res = curl_easy_perform(client_);
+        curl_slist_free_all(headers);  // Free headers
+        if (res != CURLE_OK) {
+            LOG(ERROR) << "Error from http client, PUT " << url
+                       << " error: " << curl_easy_strerror(res);
+            return false;
+        }
+
+        // Get the HTTP response code
+        long responseCode;
+        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
+        if (responseCode != 200) {
+            LOG(ERROR) << "Unexpected code in http response, PUT " << url
+                       << " response code: " << responseCode
+                       << " response body: " << readBuffer;
+            return false;
+        }
+
+        return true;
+    }
+
+    virtual bool remove(const std::string &key) {
+        curl_easy_reset(client_);
+        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
+
+        if (globalConfig().verbose)
+            LOG(INFO) << "Remove segment desc, key=" << key;
+
+        std::string url = encodeUrl(key);
+        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(client_, CURLOPT_CUSTOMREQUEST, "DELETE");
+
+        // get response body
+        std::string readBuffer;
+        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
+        CURLcode res = curl_easy_perform(client_);
+        if (res != CURLE_OK) {
+            LOG(ERROR) << "Error from http client, DELETE " << url
+                       << " error: " << curl_easy_strerror(res);
+            return false;
+        }
+
+        // Get the HTTP response code
+        long responseCode;
+        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
+        if (responseCode != 200) {
+            LOG(ERROR) << "Unexpected code in http response, DELETE " << url
+                       << " response code: " << responseCode
+                       << " response body: " << readBuffer;
+            return false;
+        }
+        return true;
+    }
+
+    CURL *client_;
+    const std::string metadata_uri_;
+};
+#endif  // USE_HTTP
+
+/**
+ * @brief Redis元数据存储插件实现
+ *
+ * 该插件使用Redis作为元数据存储后端，提供：
+ * 1. 高性能的键值存储
+ * 2. 支持数据持久化
+ * 3. 支持主从复制和集群部署
+ */
+struct RedisMetadataStoragePlugin : public MetadataStoragePlugin {
+    RedisMetadataStoragePlugin(const std::string &metadata_uri)
         : client_(nullptr), metadata_uri_(metadata_uri) {
         auto hostname_port = parseHostNameWithPort(metadata_uri);
         client_ =
@@ -50,7 +227,7 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         }
     }
 
-    virtual ~RedisStoragePlugin() {}
+    virtual ~RedisMetadataStoragePlugin() {}
 
     virtual bool get(const std::string &key, Json::Value &value) {
         Json::Reader reader;
@@ -602,3 +779,4 @@ std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
 }
 
 }  // namespace mooncake
+

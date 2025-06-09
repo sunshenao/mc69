@@ -34,86 +34,129 @@
 
 namespace mooncake {
 
-class RdmaEndPoint;
-class RdmaTransport;
-class WorkerPool;
-class EndpointStore;
-
-// RdmaContext represents the set of resources controlled by each local NIC,
-// including Memory Region, CQ, EndPoint (QPs), etc.
+/**
+ * @class RdmaContext
+ * @brief RDMA设备上下文管理类
+ *
+ * 该类负责管理单个RDMA网卡(NIC)的所有资源，包括：
+ * 1. 内存区域（Memory Region）管理
+ * 2. 完成队列（Completion Queue）管理
+ * 3. 端点（QP）管理
+ * 4. 事件通道管理
+ *
+ * 每个物理网卡对应一个RdmaContext实例。
+ */
 class RdmaContext {
    public:
+    /**
+     * @brief 构造函数
+     * @param engine RDMA传输引擎的引用
+     * @param device_name 设备名称，如 "mlx5_0"
+     */
     RdmaContext(RdmaTransport &engine, const std::string &device_name);
 
+    /**
+     * @brief 析构函数
+     * 负责清理所有RDMA资源：
+     * 1. 销毁所有端点
+     * 2. 注销内存区域
+     * 3. 释放完成队列和事件通道
+     */
     ~RdmaContext();
 
+    /**
+     * @brief 构建RDMA上下文
+     * @param num_cq_list 完成队列数量
+     * @param num_comp_channels 完成事件通道数量
+     * @param port RDMA端口号
+     * @param gid_index GID索引（用于RoCE网络）
+     * @param max_cqe 每个完成队列的最大条目数
+     * @param max_ep_per_ctx 每个上下文的最大端点数
+     * @param max_qp_per_ep 每个端点的最大队列对数
+     * @param max_sge 每个请求的最大分散/聚集元素数
+     * @param max_wr 每个队列对的最大工作请求数
+     * @param max_inline 最大内联数据大小
+     * @return 成功返回0，失败返回错误码
+     */
     int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
                   uint8_t port = 1, int gid_index = 0, size_t max_cqe = 4096,
-                  int max_endpoints = 256);
+                  int max_ep_per_ctx = 256, size_t num_qp_per_ep = 2,
+                  size_t max_sge = 4, size_t max_wr = 256,
+                  size_t max_inline = 64);
+
+    /**
+     * @brief 注册内存区域
+     * @param addr 内存地址
+     * @param length 内存长度
+     * @param access_flags 访问权限标志
+     * @return 已注册的内存区域指针，失败返回nullptr
+     *
+     * 该方法会：
+     * 1. 向RDMA设备注册内存区域
+     * 2. 获取内存区域的本地密钥(lkey)和远程密钥(rkey)
+     * 3. 将内存区域加入管理集合
+     */
+    struct ibv_mr *registerMemory(void *addr, size_t length,
+                                 int access_flags = IBV_ACCESS_LOCAL_WRITE |
+                                                  IBV_ACCESS_REMOTE_READ |
+                                                  IBV_ACCESS_REMOTE_WRITE);
+
+    /**
+     * @brief 注销内存区域
+     * @param addr 内存地址
+     * @return 成功返回0，失败返回错误码
+     */
+    int deregisterMemory(void *addr);
+
+    /**
+     * @brief 从内存池分配页对齐的内存
+     * @param size 需要的内存大小
+     * @return 分配的内存地址
+     */
+    void *allocAlignedMemory(size_t size);
+
+    /**
+     * @brief 归还分配的页对齐内存
+     * @param ptr 要释放的内存地址
+     */
+    void freeAlignedMemory(void *ptr);
+
+    /**
+     * @brief 获取当前上下文的端点数量
+     * @return 端点数量
+     */
+    size_t getEndpointCount() const { return endpoint_count_; }
+
+    /**
+     * @brief 获取设备名称
+     * @return 设备名称字符串
+     */
+    const std::string &getDeviceName() const { return device_name_; }
+
+    /**
+     * @brief 获取本地标识符(LID)
+     * @return 本地标识符
+     */
+    uint16_t getLid() const { return port_attr_.lid; }
+
+    /**
+     * @brief 获取全局标识符(GID)
+     * @return GID字符串
+     */
+    const std::string &getGid() const { return gid_str_; }
 
    private:
-    int deconstruct();
+    /**
+     * @brief 初始化工作池
+     * 创建并启动完成队列的事件处理线程
+     */
+    void initializeWorkerPool();
 
-   public:
-    // Memory Region Management
-    int registerMemoryRegion(void *addr, size_t length, int access);
-
-    int unregisterMemoryRegion(void *addr);
-
-    uint32_t rkey(void *addr);
-
-    uint32_t lkey(void *addr);
-
-   public:
-    bool active() const { return active_; }
-
-    void set_active(bool flag) { active_ = flag; }
-
-   public:
-    // EndPoint Management
-    std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
-
-    int deleteEndpoint(const std::string &peer_nic_path);
-
-   public:
-    // Device name, such as `mlx5_3`
-    std::string deviceName() const { return device_name_; }
-
-    // NIC Path, such as `192.168.3.76@mlx5_3`
-    std::string nicPath() const;
-
-   public:
-    uint16_t lid() const { return lid_; }
-
-    std::string gid() const;
-
-    int gidIndex() const { return gid_index_; }
-
-    ibv_context *context() const { return context_; }
-
-    RdmaTransport &engine() const { return engine_; }
-
-    ibv_pd *pd() const { return pd_; }
-
-    uint8_t portNum() const { return port_; }
-
-    int activeSpeed() const { return active_speed_; }
-
-    ibv_mtu activeMTU() const { return active_mtu_; }
-
-    ibv_comp_channel *compChannel();
-
-    int compVector();
-
-    int eventFd() const { return event_fd_; }
-
-    ibv_cq *cq();
-
-    int cqCount() const { return cq_list_.size(); }
-
-    int poll(int num_entries, ibv_wc *wc, int cq_index = 0);
-
-    int socketId();
+    /**
+     * @brief 清理工作池资源
+     * 停止所有事件处理线程并释放资源
+     */
+    void cleanupWorkerPool();
 
    private:
     int openRdmaDevice(const std::string &device_name, uint8_t port,
@@ -136,32 +179,9 @@ class RdmaContext {
     ibv_pd *pd_ = nullptr;
     int event_fd_ = -1;
 
-    size_t num_comp_channel_ = 0;
-    ibv_comp_channel **comp_channel_ = nullptr;
-
-    uint8_t port_ = 0;
-    uint16_t lid_ = 0;
-    int gid_index_ = -1;
-    int active_speed_ = -1;
-    ibv_mtu active_mtu_;
-    ibv_gid gid_;
-
-    RWSpinlock memory_regions_lock_;
-    std::vector<ibv_mr *> memory_region_list_;
-    std::vector<ibv_cq *> cq_list_;
-
-    std::shared_ptr<EndpointStore> endpoint_store_;
-
-    std::vector<std::thread> background_thread_;
-    std::atomic<bool> threads_running_;
-
-    std::atomic<int> next_comp_channel_index_;
-    std::atomic<int> next_comp_vector_index_;
-    std::atomic<int> next_cq_list_index_;
-
-    std::shared_ptr<WorkerPool> worker_pool_;
-
-    volatile bool active_;
+    // 内存区域映射表，用于管理所有注册的内存区域
+    std::unordered_map<void *, struct ibv_mr *> mr_map_;
+    RWSpinlock mr_map_lock_;                    // 内存区域映射表的读写锁
 };
 
 }  // namespace mooncake

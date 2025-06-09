@@ -15,32 +15,44 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-#include <glog/logging.h>
-#include <numa.h>
-#include <sys/mman.h>
-#include <sys/time.h>
-#include <unistd.h>
+// 引入所需的系统和标准库头文件
+#include <glog/logging.h>  // Google logging库，用于日志记录
+#include <numa.h>         // NUMA（非统一内存访问）相关操作
+#include <sys/mman.h>     // 内存管理函数
+#include <sys/time.h>     // 时间相关函数
+#include <unistd.h>       // POSIX操作系统API
 
-#include <atomic>
-#include <cstdint>
-#include <ctime>
-#include <thread>
+#include <atomic>         // 原子操作
+#include <cstdint>       // 标准整数类型
+#include <ctime>         // 时间相关函数
+#include <thread>        // 线程支持
 
 #include "error.h"
 
+// CPU架构相关的优化指令
 #if defined(__x86_64__)
-#include <immintrin.h>
-#define PAUSE() _mm_pause()
+#include <immintrin.h>    // Intel内联函数
+#define PAUSE() _mm_pause()  // CPU暂停指令，用于自旋锁优化
 #else
 #define PAUSE()
 #endif
 
-#define likely(x) __glibc_likely(x)
-#define unlikely(x) __glibc_unlikely(x)
+// 性能优化相关的宏，用于分支预测
+#define likely(x) __glibc_likely(x)    // 提示编译器该条件很可能为真
+#define unlikely(x) __glibc_unlikely(x) // 提示编译器该条件很可能为假
 
 namespace mooncake {
+// 本地段ID常量定义
 const static int LOCAL_SEGMENT_ID = 0;
 
+/**
+ * 将当前线程绑定到指定的NUMA节点（CPU插槽）
+ * @param socket_id NUMA节点ID
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数实现了CPU亲和性设置，确保线程在指定的CPU核心上运行，
+ * 可以提高内存访问效率，减少跨NUMA节点访问带来的性能损失
+ */
 static inline int bindToSocket(int socket_id) {
     if (unlikely(numa_available() < 0)) {
         LOG(ERROR) << "The platform does not support NUMA";
@@ -70,6 +82,13 @@ static inline int bindToSocket(int socket_id) {
     return 0;
 }
 
+/**
+ * 获取当前时间的纳秒级时间戳
+ * @return 返回纳秒级的时间戳，出错时返回错误码
+ *
+ * 使用系统的实时时钟获取高精度时间戳，
+ * 常用于性能测量和时间相关的操作
+ */
 static inline int64_t getCurrentTimeInNano() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     struct timespec ts;
@@ -80,8 +99,20 @@ static inline int64_t getCurrentTimeInNano() {
     return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
 }
 
+/**
+ * 获取默认的握手端口号
+ * @return 返回默认使用的网络端口号
+ */
 uint16_t getDefaultHandshakePort();
 
+/**
+ * 解析包含主机名和端口号的服务器地址字符串
+ * @param server_name 格式为"hostname:port"的服务器地址字符串
+ * @return 返回一个pair，first为主机名，second为端口号
+ *
+ * 如果没有指定端口号，则使用默认端口
+ * 如果指定的端口号非法，会记录警告并使用默认端口
+ */
 static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
     const std::string &server_name) {
     uint16_t port = getDefaultHandshakePort();
@@ -98,6 +129,15 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
     return std::make_pair(trimmed_server_name, port);
 }
 
+/**
+ * 从文件描述符中写入指定长度的数据，直到全部写入
+ * @param fd 文件描述符
+ * @param buf 数据缓冲区
+ * @param len 要写入的数据长度
+ * @return 成功时返回写入的字节数，失败时返回错误码
+ *
+ * 该函数会处理EAGAIN和EINTR错误，确保尽可能多地写入数据
+ */
 static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     char *pos = (char *)buf;
     size_t nbytes = len;
@@ -119,6 +159,15 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     return len;
 }
 
+/**
+ * 从文件描述符中读取指定长度的数据，直到全部读取
+ * @param fd 文件描述符
+ * @param buf 数据缓冲区
+ * @param len 要读取的数据长度
+ * @return 成功时返回读取的字节数，失败时返回错误码
+ *
+ * 该函数会处理EAGAIN和EINTR错误，确保尽可能多地读取数据
+ */
 static inline ssize_t readFully(int fd, void *buf, size_t len) {
     char *pos = (char *)buf;
     size_t nbytes = len;
@@ -140,6 +189,15 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
     return len;
 }
 
+/**
+ * 将字符串数据写入到套接字中，前面带有长度信息
+ * @param fd 套接字文件描述符
+ * @param str 要写入的字符串
+ * @return 成功返回0，失败返回错误码
+ *
+ * 该函数会先将字符串长度以uint64_t类型写入，
+ * 然后再将字符串内容写入套接字
+ */
 static inline int writeString(int fd, const std::string &str) {
     uint64_t length = str.size();
     if (writeFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
@@ -149,6 +207,14 @@ static inline int writeString(int fd, const std::string &str) {
     return 0;
 }
 
+/**
+ * 从套接字中读取字符串数据，前面带有长度信息
+ * @param fd 套接字文件描述符
+ * @return 读取到的字符串，出错时返回空字符串
+ *
+ * 该函数会先读取字符串的长度信息，
+ * 然后根据长度读取字符串内容
+ */
 static inline std::string readString(int fd) {
     const static size_t kMaxLength = 1ull << 20;
     uint64_t length = 0;
@@ -164,6 +230,13 @@ static inline std::string readString(int fd) {
 }
 
 const static std::string NIC_PATH_DELIM = "@";
+/**
+ * 从NIC路径中提取服务器名称部分
+ * @param nic_path NIC路径字符串
+ * @return 服务器名称
+ *
+ * NIC路径的格式为"hostname@nicname"，该函数提取"hostname"部分
+ */
 static inline const std::string getServerNameFromNicPath(
     const std::string &nic_path) {
     size_t pos = nic_path.find(NIC_PATH_DELIM);
@@ -171,6 +244,13 @@ static inline const std::string getServerNameFromNicPath(
     return nic_path.substr(0, pos);
 }
 
+/**
+ * 从NIC路径中提取NIC名称部分
+ * @param nic_path NIC路径字符串
+ * @return NIC名称
+ *
+ * NIC路径的格式为"hostname@nicname"，该函数提取"nicname"部分
+ */
 static inline const std::string getNicNameFromNicPath(
     const std::string &nic_path) {
     size_t pos = nic_path.find(NIC_PATH_DELIM);
@@ -178,17 +258,42 @@ static inline const std::string getNicNameFromNicPath(
     return nic_path.substr(pos + 1);
 }
 
+/**
+ * 构造NIC路径字符串
+ * @param server_name 服务器名称
+ * @param nic_name NIC名称
+ * @return 构造的NIC路径字符串
+ *
+ * NIC路径的格式为"hostname@nicname"，该函数用于连接主机名和NIC名称
+ */
 static inline const std::string MakeNicPath(const std::string &server_name,
                                             const std::string &nic_name) {
     return server_name + NIC_PATH_DELIM + nic_name;
 }
 
+/**
+ * 检查两个内存区域是否重叠
+ * @param a 内存区域a的指针
+ * @param a_len 内存区域a的长度
+ * @param b 内存区域b的指针
+ * @param b_len 内存区域b的长度
+ * @return 如果重叠返回true，否则返回false
+ *
+ * 该函数用于检测两个内存块是否存在交叉，
+ * 常用于内存管理和安全检查
+ */
 static inline bool overlap(const void *a, size_t a_len, const void *b,
                            size_t b_len) {
     return (a >= b && a < (char *)b + b_len) ||
            (b >= a && b < (char *)a + a_len);
 }
 
+/**
+ * 自旋读写锁实现，支持多读单写的锁语义
+ *
+ * 该锁允许多个线程同时读取，或一个线程写入，
+ * 通过自旋等待和CAS操作实现高效的锁机制
+ */
 class RWSpinlock {
     union RWTicket {
         constexpr RWTicket() : whole(0) {}
@@ -314,6 +419,12 @@ class RWSpinlock {
     uint64_t padding_[15];
 };
 
+/**
+ * 唯一锁（Ticket Lock）实现
+ *
+ * 该锁使用票据机制实现线程间的互斥访问，
+ * 每个线程获取一个票据，只有持有当前票据的线程才能访问临Critical Section
+ */
 class TicketLock {
    public:
     TicketLock() : next_ticket_(0), now_serving_(0) {}
@@ -333,6 +444,12 @@ class TicketLock {
     uint64_t padding_[14];
 };
 
+/**
+ * 简单伪随机数生成器
+ *
+ * 该类实现了一个简单的线性同余生成器（LCG），
+ * 用于生成伪随机数序列
+ */
 class SimpleRandom {
    public:
     SimpleRandom(uint32_t seed) : current(seed) {}

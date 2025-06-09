@@ -30,29 +30,68 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+
+// 类型别名，简化代码
 using tcpsocket = boost::asio::ip::tcp::socket;
+
+// 默认传输缓冲区大小：64KB
 const static size_t kDefaultBufferSize = 65536;
 
+/**
+ * @struct SessionHeader
+ * @brief TCP会话头部结构
+ *
+ * 包含了传输必要的元数据：
+ * - size: 传输数据大小
+ * - addr: 目标地址
+ * - opcode: 操作类型（读/写）
+ */
 struct SessionHeader {
-    uint64_t size;
-    uint64_t addr;
-    uint8_t opcode;
+    uint64_t size;      // 数据大小
+    uint64_t addr;      // 目标地址
+    uint8_t opcode;     // 操作类型
 };
 
+/**
+ * @class Session
+ * @brief TCP会话类，处理单个TCP连接
+ *
+ * 该类实现了异步TCP传输：
+ * 1. 支持读写操作
+ * 2. 使用异步IO提高性能
+ * 3. 实现了流量控制
+ */
 struct Session : public std::enable_shared_from_this<Session> {
+    /**
+     * @brief 构造函数
+     * @param socket TCP套接字
+     */
     explicit Session(tcpsocket socket) : socket_(std::move(socket)) {}
 
-    tcpsocket socket_;
-    SessionHeader header_;
-    uint64_t total_transferred_bytes_;
-    char *local_buffer_;
-    std::function<void(TransferStatusEnum)> on_finalize_;
-    std::mutex session_mutex_;
+    tcpsocket socket_;                  // TCP套接字
+    SessionHeader header_;              // 会话头部
+    uint64_t total_transferred_bytes_;  // 已传输字节数
+    char *local_buffer_;               // 本地缓冲区
+    std::function<void(TransferStatusEnum)> on_finalize_;  // 完成回调
+    std::mutex session_mutex_;         // 会话锁
 
+    /**
+     * @brief 发起传输
+     * @param buffer 本地缓冲区
+     * @param dest_addr 目标地址
+     * @param size 数据大小
+     * @param opcode 操作类型
+     *
+     * 该函数启动TCP传输：
+     * 1. 设置传输参数
+     * 2. 发送会话头部
+     * 3. 根据操作类型读写数据
+     */
     void initiate(void *buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
         session_mutex_.lock();
         local_buffer_ = (char *)buffer;
+        // 主机序转网络序
         header_.addr = htole64(dest_addr);
         header_.size = htole64(size);
         header_.opcode = (uint8_t)opcode;
@@ -60,6 +99,13 @@ struct Session : public std::enable_shared_from_this<Session> {
         writeHeader();
     }
 
+    /**
+     * @brief 接受新连接
+     *
+     * 该函数处理新的TCP连接：
+     * 1. 重置传输计数器
+     * 2. 开始读取会话头部
+     */
     void onAccept() {
         session_mutex_.lock();
         total_transferred_bytes_ = 0;
@@ -67,99 +113,142 @@ struct Session : public std::enable_shared_from_this<Session> {
     }
 
    private:
+    /**
+     * @brief 写入会话头部
+     *
+     * 该函数异步写入会话头部：
+     * 1. 提交异步写请求
+     * 2. 根据操作类型继续读或写数据
+     * 3. 错误时回调通知失败
+     */
     void writeHeader() {
         // LOG(INFO) << "writeHeader";
         auto self(shared_from_this());
         boost::asio::async_write(
             socket_, boost::asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const boost::system::error_code &ec, std::size_t len) {
+                // 检查写入是否成功
                 if (ec || len != sizeof(SessionHeader)) {
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
                 }
+                // 根据操作类型继续操作
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
-                    writeBody();
+                    writeBody();  // 写操作：继续写数据
                 else
-                    readBody();
+                    readBody();   // 读操作：开始读数据
             });
     }
 
+    /**
+     * @brief 读取会话头部
+     *
+     * 该函数异步读取会话头部：
+     * 1. 提交异步读请求
+     * 2. 解析头部信息
+     * 3. 根据操作类型继续读或写数据
+     */
     void readHeader() {
         // LOG(INFO) << "readHeader";
         auto self(shared_from_this());
         boost::asio::async_read(
             socket_, boost::asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const boost::system::error_code &ec, std::size_t len) {
+                // 检查读取是否成功
                 if (ec || len != sizeof(SessionHeader)) {
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
                 }
 
+                // 网络序转主机序
                 local_buffer_ = (char *)(le64toh(header_.addr));
+                // 根据操作类型继续操作
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
-                    readBody();
+                    readBody();    // 写操作：接收数据
                 else
-                    writeBody();
+                    writeBody();   // 读操作：发送数据
             });
     }
 
+    /**
+     * @brief 写入数据体
+     *
+     * 该函数异步写入数据：
+     * 1. 计算当前传输块大小
+     * 2. 提交异步写请求
+     * 3. 处理完成回调
+     */
     void writeBody() {
         // LOG(INFO) << "writeBody";
         auto self(shared_from_this());
-        uint64_t size = le64toh(header_.size);
-        char *addr = local_buffer_;
-
-        size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
-        if (buffer_size == 0) {
+        const size_t remaining_bytes = le64toh(header_.size) - total_transferred_bytes_;
+        if (!remaining_bytes) {
+            // 传输完成
             if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
             session_mutex_.unlock();
             return;
         }
-
+        // 计算传输块大小
+        const size_t transfer_size =
+            std::min(remaining_bytes, kDefaultBufferSize);
+        // 异步写入数据
         boost::asio::async_write(
             socket_,
-            boost::asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const boost::system::error_code &ec,
-                               std::size_t transferred_bytes) {
+            boost::asio::buffer(local_buffer_ + total_transferred_bytes_,
+                               transfer_size),
+            [this, self](const boost::system::error_code &ec,
+                         std::size_t len) {
+                // 检查写入是否成功
                 if (ec) {
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
                 }
-                total_transferred_bytes_ += transferred_bytes;
-                writeBody();
+                // 更新传输计数
+                total_transferred_bytes_ += len;
+                writeBody();  // 继续写入剩余数据
             });
     }
 
+    /**
+     * @brief 读取数据体
+     *
+     * 该函数异步读取数据：
+     * 1. 计算当前传输块大小
+     * 2. 提交异步读请求
+     * 3. 处理完成回调
+     */
     void readBody() {
         // LOG(INFO) << "readBody";
         auto self(shared_from_this());
-        uint64_t size = le64toh(header_.size);
-        char *addr = local_buffer_;
-
-        size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
-        if (buffer_size == 0) {
+        const size_t remaining_bytes = le64toh(header_.size) - total_transferred_bytes_;
+        if (!remaining_bytes) {
+            // 传输完成
             if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
             session_mutex_.unlock();
             return;
         }
-
+        // 计算传输块大小
+        const size_t transfer_size =
+            std::min(remaining_bytes, kDefaultBufferSize);
+        // 异步读取数据
         boost::asio::async_read(
             socket_,
-            boost::asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const boost::system::error_code &ec,
-                               std::size_t transferred_bytes) {
+            boost::asio::buffer(local_buffer_ + total_transferred_bytes_,
+                               transfer_size),
+            [this, self](const boost::system::error_code &ec,
+                         std::size_t len) {
+                // 检查读取是否成功
                 if (ec) {
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
                 }
-                total_transferred_bytes_ += transferred_bytes;
-                readBody();
+                // 更新传输计数
+                total_transferred_bytes_ += len;
+                readBody();  // 继续读取剩余数据
             });
     }
 };
