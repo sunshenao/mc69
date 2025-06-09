@@ -54,7 +54,7 @@ class TransferMetadata {
      * @brief 设备描述符，描述网络设备（如RDMA网卡）的属性
      */
     struct DeviceDesc {
-        std::string name;    // 设备名称
+        std::string name;    // 设备名称 如 mlx5_0、eth0 等）
         uint16_t lid;        // 本地标识符（用于IB网络）
         std::string gid;     // 全局标识符（用于RoCE网络）
     };
@@ -71,7 +71,9 @@ class TransferMetadata {
         std::vector<uint32_t> rkey; // 远程内存密钥列表
     };
 
-    /**
+    /**  是一种将 NVMe（Non-Volatile Memory Express，非易失性内存标准）协议通过网络（如以太网、InfiniBand、RoCE 等）扩展到远程存储设备的技术。
+     它允许服务器像访问本地 NVMe SSD 一样，通过高速网络访问远程的 NVMe 存储，具备高带宽、低延迟的特点，常用于数据中心和高性能计算场景。
+     也就是说NVMe 可以看作本地文件
      * @struct NVMeoFBufferDesc
      * @brief NVMe-oF缓冲区描述符，描述NVMe设备上的存储区域
      */
@@ -98,6 +100,16 @@ class TransferMetadata {
     };
 
    public:
+
+//   RPC主要用于以下几个方面
+//a) 节点发现和管理
+    //每个节点启动时都会注册自己的 RPC 信息到元数据服务
+    //其他节点可以通过查询元数据服务发现集群中的其他节点
+    //用于监控节点状态，发现节点失效
+//b) 握手协议协调
+    //在建立 RDMA 连接前，需要交换连接信息
+    //使用 RPC 完成初始的握手过程
+
     /**
      * @brief RPC元数据描述结构体
      * 用于描述RPC节点的基本信息和状态

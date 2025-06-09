@@ -42,6 +42,7 @@ namespace mooncake {
  * 3. 可用的备选网络适配器列表
  */
 struct TopologyEntry {
+// hca为专用高性能网络适配器，而nic则为一般网络适配器
     std::string name;                      // 存储类型名称
     std::vector<std::string> preferred_hca; // 优选的网络适配器列表
     std::vector<std::string> avail_hca;     // 可用的备选网络适配器列表

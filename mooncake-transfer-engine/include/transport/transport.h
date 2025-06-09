@@ -144,35 +144,101 @@ class Transport {
     virtual int getTransferStatus(BatchID batch_id, size_t task_id,
                                   TransferStatus &status) = 0;
 
-    std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
-
-   protected:
-    virtual int install(std::string &local_server_name,
-                        std::shared_ptr<TransferMetadata> meta,
-                        std::shared_ptr<Topology> topo);
-
-    std::string local_server_name_;
+    /**
+     * @brief 元数据服务实例指针
+     * 用于管理所有传输相关的元数据信息：
+     * - 内存段注册信息
+     * - 节点状态信息
+     * - 拓扑信息
+     */
     std::shared_ptr<TransferMetadata> metadata_;
 
+    /**
+     * @brief 批次描述符的读写锁
+     * 用于保护批次描述符集合的并发访问
+     */
     RWSpinlock batch_desc_lock_;
+
+    /**
+     * @brief 批次描述符集合
+     * 存储所有活跃的传输批次：
+     * - 键：批次ID
+     * - 值：批次描述符
+     */
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
    private:
+    /**
+     * @brief 注册本地内存区域
+     * @param addr 内存地址
+     * @param length 内存长度（字节）
+     * @param location 内存位置标识（如 "CPU", "GPU"）
+     * @param remote_accessible 是否允许远程访问
+     * @param update_metadata 是否更新元数据服务
+     * @return 成功返回0，失败返回错误码
+     *
+     * 将本地内存注册到传输层：
+     * 1. 向硬件注册内存区域（如RDMA注册）
+     * 2. 获取访问密钥（如RDMA的lkey/rkey）
+     * 3. 可选地更新到元数据服务
+     */
     virtual int registerLocalMemory(void *addr, size_t length,
-                                    const std::string &location,
-                                    bool remote_accessible,
+                                  const std::string &location,
+                                  bool remote_accessible,
+                                  bool update_metadata = true) = 0;
+
+    /**
+     * @brief 注销本地内存区域
+     * @param addr 要注销的内存地址
+     * @param update_metadata 是否更新元数据服务
+     * @return 成功返回0，失败返回错误码
+     *
+     * 从传输层注销内存：
+     * 1. 从硬件注销内存区域
+     * 2. 清理相关资源
+     * 3. 可选地更新元数据服务
+     */
+    virtual int unregisterLocalMemory(void *addr,
                                     bool update_metadata = true) = 0;
 
-    virtual int unregisterLocalMemory(void *addr,
-                                      bool update_metadata = true) = 0;
-
+    /**
+     * @brief 批量注册本地内存
+     * @param buffer_list 要注册的缓冲区列表
+     * @param location 内存位置标识
+     * @return 成功返回0，失败返回错误码
+     *
+     * 批量注册优化：
+     * 1. 减少系统调用次数
+     * 2. 提高注册效率
+     * 3. 支持原子操作
+     */
     virtual int registerLocalMemoryBatch(
         const std::vector<BufferEntry> &buffer_list,
         const std::string &location) = 0;
 
+    /**
+     * @brief 批量注销本地内存
+     * @param addr_list 要注销的地址列表
+     * @return 成功返回0，失败返回错误码
+     *
+     * 批量注销优化：
+     * 1. 减少系统调用次数
+     * 2. 提高注销效率
+     * 3. 支持原子操作
+     */
     virtual int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) = 0;
 
+    /**
+     * @brief 获取传输层名称
+     * @return 传输层名称字符串
+     *
+     * 用于标识不同的传输协议实现：
+     * - "RDMA" - RDMA传输
+     * - "TCP" - TCP传输
+     * - "NVMeOF" - NVMe-oF传输
+     * - "CXL" - CXL传输
+     */
     virtual const char *getName() const = 0;
 };
 }  // namespace mooncake

@@ -93,10 +93,13 @@ class TransferEngine {
     int freeEngine();
 
     /**
-     * @brief 安装传输协议（仅用于测试）
+     * @brief 安装传输协议
      * @param proto 协议名称
      * @param args 协议参数
      * @return 传输协议实例指针
+     *
+     * @note 仅用于测试 - 该函数只在测试环境中使用，用于手动安装和配置传输协议
+     * 在正常运行环境中，传输协议的安装和配置由系统自动完成
      */
     Transport *installTransport(const std::string &proto, void **args);
 
@@ -104,6 +107,9 @@ class TransferEngine {
      * @brief 卸载传输协议
      * @param proto 协议名称
      * @return 成功返回0，失败返回错误码
+     *
+     * @note 仅用于测试 - 该函数只在测试环境中使用，用于手动卸载传输协议
+     * 在正常运行环境中，传输协议的生命周期由系统自动管理
      */
     int uninstallTransport(const std::string &proto);
 
@@ -230,6 +236,19 @@ class TransferEngine {
      */
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
+    // auto_discover_ 的注释也应该更新
+    // Discover topology and install transports automatically when it's true.
+    // @note 仅用于测试 - 设置为 false 仅用于测试场景，正常运行时应始终为 true
+    bool auto_discover_;
+
+    /**
+     * @brief 检查内存区域是否重叠
+     * @param addr 内存地址
+     * @param length 内存长度
+     * @return 如果有重叠返回true，否则返回false
+     *
+     * @note 仅用于测试 - 该函数用于测试内存注册的边界情况
+     */
     bool checkOverlap(void *addr, uint64_t length);
 
    private:
@@ -245,9 +264,6 @@ class TransferEngine {
     std::shared_ptr<MultiTransport> multi_transports_;
     std::vector<MemoryRegion> local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
-    // Discover topology and install transports automatically when it's true.
-    // Set it to false only for testing.
-    bool auto_discover_;
 };
 }  // namespace mooncake
 
