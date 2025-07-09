@@ -61,12 +61,16 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
  * 1. 检查所有任务是否完成
  * 2. 从全局管理集合中移除
  * 3. 释放批次描述符内存
+ * 首先写完补充材料的函，然后我就要去找人盖章
  */
 int Transport::freeBatchID(BatchID batch_id) {
     // 获取批次描述符
     auto &batch_desc = *((BatchDesc *)(batch_id));
 
-    // 检查所有任务是否完成
+    // 检查所有任务是否完成 今天晚上先把研究生的考察表写完，在写2页的思想汇报
+    // 至于发展对象座谈会表，到底是他们写，还是我在找呢，到底要怎么整呢
+    // 座谈会，到底要找谁签名呢，要找谁呢，还差3个人，现在差5个签名，首先 住在一起的2个，还差3个，
+    // 这3个要怎么写呢，找谁呢，我相信回龙观肯定有3个科大的，但是不太好找呀，
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         // 如果存在未完成的任务，返回错误

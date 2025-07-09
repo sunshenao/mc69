@@ -113,8 +113,8 @@ struct TransferHandshakeUtil {
  */
 TransferMetadata::TransferMetadata(const std::string &conn_string) {
     // 创建握手和存储插件
-    handshake_plugin_ = HandShakePlugin::Create(conn_string);
-    storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
+    handshake_plugin_ = HandShakePlugin::Create(conn_string); // conn_string只有一个握手插件
+    storage_plugin_ = MetadataStoragePlugin::Create(conn_string); // 可以设置http、etcd、redis等存储插件
     if (!handshake_plugin_ || !storage_plugin_) {
         LOG(ERROR) << "Unable to create metadata plugins with conn string "
                    << conn_string;
@@ -235,6 +235,7 @@ int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
 std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     const std::string &segment_name) {
     Json::Value segmentJSON;
+    // 通过segment_name名，获得可以然后在进行操作
     if (!storage_plugin_->get(getFullMetadataKey(segment_name), segmentJSON)) {
         LOG(WARNING) << "Failed to retrieve segment descriptor, name "
                      << segment_name;
@@ -331,7 +332,7 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
  * 1. 遍历所有段ID到描述符的映射
  * 2. 跳过本地段ID
  * 3. 重新获取段描述符并更新缓存
- */
+ */ // 从远程元数据服务中获取段描述符并更新本地缓存
 int TransferMetadata::syncSegmentCache() {
     RWSpinlock::WriteGuard guard(segment_lock_);
     LOG(INFO) << "Invalidate segment descriptor cache";
@@ -358,7 +359,7 @@ int TransferMetadata::syncSegmentCache() {
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByName(const std::string &segment_name,
                                        bool force_update) {
-    if (!force_update) {
+    if (!force_update) { // 是否需要进行强制更新
         RWSpinlock::ReadGuard guard(segment_lock_);
         auto iter = segment_name_to_id_map_.find(segment_name);
         if (iter != segment_name_to_id_map_.end())
@@ -428,8 +429,10 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     RWSpinlock::WriteGuard guard(segment_lock_);
     if (segment_name_to_id_map_.count(segment_name))
         return segment_name_to_id_map_[segment_name];
+        // 本地缓存找不到，就去元数据服务获取段描述符
     auto segment_desc = this->getSegmentDesc(segment_name);
     if (!segment_desc) return -1;
+    // 获取之后，将其加入到本地缓存中
     SegmentID id = next_segment_id_.fetch_add(1);
     segment_id_to_desc_map_[id] = segment_desc;
     segment_name_to_id_map_[segment_name] = id;
@@ -488,6 +491,7 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
  */
 int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
+    // 向本地段添加一个新的内存缓冲区
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
@@ -653,13 +657,13 @@ int TransferMetadata::startHandshakeDaemon(
  */
 int TransferMetadata::sendHandshake(const std::string &peer_server_name,
                                     const HandShakeDesc &local_desc,
-                                    HandShakeDesc &peer_desc) {
+                                    HandShakeDesc &peer_desc) { // peer_desc接受对方服务器的相应信息
     RpcMetaDesc peer_location;
     if (getRpcMetaEntry(peer_server_name, peer_location)) {
         return ERR_METADATA;
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
-    Json::Value peer;
+    Json::Value peer;// 就是接受对法发送回来的结果的数据
     int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
     if (ret) return ret;

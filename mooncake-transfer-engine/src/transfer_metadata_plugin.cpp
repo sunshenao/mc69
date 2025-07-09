@@ -46,7 +46,7 @@ namespace mooncake {
  * @param nmemb 数据块的数量
  * @param userdata 用户自定义数据指针
  * @return size_t 实际处理的数据大小
- */
+ */ // 将要写入的内容追加到用户数据中
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userdata) {
     ((std::string*)userdata)->append((char*)contents, size * nmemb);
     return size * nmemb;
@@ -64,7 +64,7 @@ struct HttpMetadataStoragePlugin : public MetadataStoragePlugin {
     HttpMetadataStoragePlugin(const std::string &metadata_uri)
         : client_(nullptr), metadata_uri_(metadata_uri) {
         curl_global_init(CURL_GLOBAL_ALL);
-        client_ = curl_easy_init();
+        client_ = curl_easy_init(); // 用于初始化一个简单会话，并返回指针
         if (!client_) {
             LOG(ERROR) << "Cannot allocate CURL objects";
             exit(EXIT_FAILURE);
@@ -95,7 +95,7 @@ struct HttpMetadataStoragePlugin : public MetadataStoragePlugin {
         // get response body
         std::string readBuffer;
         curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
-        CURLcode res = curl_easy_perform(client_);
+        CURLcode res = curl_easy_perform(client_); // 开始读取数据
         if (res != CURLE_OK) {
             LOG(ERROR) << "Error from http client, GET " << url
                        << " error: " << curl_easy_strerror(res);
@@ -116,7 +116,7 @@ struct HttpMetadataStoragePlugin : public MetadataStoragePlugin {
             LOG(INFO) << "Get segment desc, key=" << key
                       << ", value=" << readBuffer;
 
-        Json::Reader reader;
+        Json::Reader reader; // 读出的数据写入到 value 中
         if (!reader.parse(readBuffer, value)) return false;
         return true;
     }
@@ -133,6 +133,7 @@ struct HttpMetadataStoragePlugin : public MetadataStoragePlugin {
 
         std::string url = encodeUrl(key);
         curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
+        // https通过WriteCallback将数据保存到用户区
         curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(client_, CURLOPT_POSTFIELDS, json_file.c_str());
         curl_easy_setopt(client_, CURLOPT_POSTFIELDSIZE, json_file.size());
@@ -547,6 +548,8 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
     return "";
 }
 
+// SocketHandShakePlugin 是一个用于“节点间握手通信”的插件类，
+// 主要作用是通过 TCP Socket 实现分布式系统中节点之间的身份交换、能力协商或连接建立等“握手”过程。
 struct SocketHandShakePlugin : public HandShakePlugin {
     SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {}
 
@@ -566,16 +569,39 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
     }
 
+    /**
+     * @brief 启动握手监听守护线程
+     *
+     * 该函数会在指定端口启动一个TCP监听socket，并在后台线程中循环等待其他节点的连接请求。
+     * 每当有新连接到来时，会读取对方发送的JSON格式握手消息，调用回调函数处理，
+     * 然后将本地的握手信息回传给对方，最后关闭连接。
+     *
+     * @param on_recv_callback 处理收到的握手消息的回调函数，类型为 void(const Json::Value &peer, Json::Value &local)
+     * @param listen_port      监听的本地端口号
+     * @return int             0表示启动成功，负数表示失败（如端口被占用、socket错误等）
+     *
+     * 主要流程：
+     * 1. 创建socket并设置超时、端口复用等参数
+     * 2. 绑定到指定端口并开始监听
+     * 3. 启动后台线程，循环accept新连接
+     * 4. 对每个连接：
+     *    - 读取对方JSON握手消息
+     *    - 调用回调处理，生成本地JSON握手消息
+     *    - 回传本地JSON消息
+     *    - 关闭连接
+     * 5. 支持多连接并发处理，直到插件析构或关闭监听
+     */
     virtual int startDaemon(OnReceiveCallBack on_recv_callback,
                             uint16_t listen_port) {
-        sockaddr_in bind_address;
-        int on = 1;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(listen_port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
 
-        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in bind_address;                  // 定义一个 IPv4 地址结构体，用于绑定本地地址和端口
+        int on = 1;                               // 用于后续 setsockopt 设置端口复用
+        memset(&bind_address, 0, sizeof(sockaddr_in)); // 将 bind_address 结构体内容清零
+        bind_address.sin_family = AF_INET;        // 设置地址族为 IPv4
+        bind_address.sin_port = htons(listen_port); // 设置端口号（主机字节序转网络字节序）
+        bind_address.sin_addr.s_addr = INADDR_ANY;   // 绑定到本机所有网卡（0.0.0.0）
+
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0); // 创建一个 TCP socket，返回文件描述符
         if (listen_fd_ < 0) {
             PLOG(ERROR) << "SocketHandShakePlugin: socket()";
             return ERR_SOCKET;
@@ -584,19 +610,20 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         struct timeval timeout;
         timeout.tv_sec = 1;
         timeout.tv_usec = 0;
+        // 设置监听socket的接收超时时间为1秒，防止accept等操作长时间阻塞
         if (setsockopt(listen_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                        sizeof(timeout))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
             closeListen();
             return ERR_SOCKET;
         }
-
+// 设置端口复用，允许端口被重复绑定（常用于服务重启时端口未完全释放的情况）
         if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
             closeListen();
             return ERR_SOCKET;
         }
-
+// 绑定socket到本地指定端口和地址
         if (bind(listen_fd_, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
             0) {
             PLOG(ERROR) << "SocketHandShakePlugin: bind (port " << listen_port
@@ -604,19 +631,22 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             closeListen();
             return ERR_SOCKET;
         }
-
-        if (listen(listen_fd_, 5)) {
+// 开始监听端口，准备接受连接请求
+        if (listen(listen_fd_, 5)) {// 5求队列的最大长度
             PLOG(ERROR) << "SocketHandShakePlugin: listen()";
             closeListen();
             return ERR_SOCKET;
         }
 
         listener_running_ = true;
+// 这种“短连接”方式适合偶尔通信、数据量小、对实时性要求不高的场景。
+// 如果需要高频率、持续的数据交换，建议使用长连接（即连接建立后多次收发数据，直到一方主动关闭）
+// 这样可以显著提升效率和性能。
         listener_ = std::thread([this, on_recv_callback]() {
             while (listener_running_) {
                 sockaddr_in addr;
                 socklen_t addr_len = sizeof(sockaddr_in);
-                int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
+                int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len); // 接受请求
                 if (conn_fd < 0) {
                     if (errno != EWOULDBLOCK)
                         PLOG(ERROR) << "SocketHandShakePlugin: accept()";
@@ -685,6 +715,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         char service[16];
         sprintf(service, "%u", rpc_port);
+        // 解析主机名和端口，获取可用的地址信息链表
+        // result这个结果由DNS服务器返回，不用连接到目标地址才返回
         if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
             PLOG(ERROR)
                 << "SocketHandShakePlugin: failed to get IP address of peer "
@@ -695,13 +727,18 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
 
         int ret = 0;
+//         某个主机可能同时支持 IPv4 和 IPv6。
+// 某个服务器可能有多个 IP 地址绑定在同一个端口上（比如多网卡或多宿主主机）。
+// DNS 解析可能会返回多个 A 记录（IPv4）或 AAAA 记录（IPv6）。
+// 这个就是找到其中合适的一个进行发送
         for (rp = result; rp; rp = rp->ai_next) {
+            // 尝试用当前地址发送消息
             ret = doSend(rp, local, peer);
             if (ret == 0) {
-                freeaddrinfo(result);
+                freeaddrinfo(result);  // 成功则释放资源并返回
                 return 0;
             }
-            if (ret == ERR_MALFORMED_JSON) {
+            if (ret == ERR_MALFORMED_JSON) { // 如果是JSON格式错误，直接返回
                 return ret;
             }
         }
@@ -745,7 +782,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             close(conn_fd);
             return ERR_SOCKET;
         }
-
+        // 这里实际上就是数据发送的方式
         int ret = writeString(conn_fd, Json::FastWriter{}.write(local));
         if (ret) {
             LOG(ERROR)
@@ -754,7 +791,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             close(conn_fd);
             return ret;
         }
-
+        // 这里就是接受对方发送的握手消息
         Json::Reader reader;
         if (!reader.parse(readString(conn_fd), peer)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive handshake "
